@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging and build artifacts
+build/
+dist/
+*.so
+*.dylib
+*.dll
+*.a
+*.o
+
+# TVM local build artifacts
+3rdparty/tvm/build/
+3rdparty/tvm/build*/
+3rdparty/tvm/dist/
+3rdparty/tvm/*.egg-info/
+3rdparty/tvm/3rdparty/tvm-ffi/build/
+3rdparty/tvm/3rdparty/tvm-ffi/dist/
+3rdparty/tvm/3rdparty/tvm-ffi/*.egg-info/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+
+# Tooling
+.cache/

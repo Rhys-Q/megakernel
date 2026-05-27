@@ -1,0 +1,45 @@
+[project]
+name = "megakernel"
+version = "0.1.0"
+description = "Development environment and build tooling for TVM/TIR experiments."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "cloudpickle",
+  "ml-dtypes",
+  "numpy",
+  "packaging",
+  "psutil",
+  "scipy",
+  "tornado",
+  "typing-extensions",
+]
+
+[dependency-groups]
+dev = [
+  "cmake>=3.24",
+  "cython>=3.0",
+  "ninja",
+  "pytest",
+  "ruff",
+  "scikit-build-core>=0.10.0",
+  "setuptools-scm",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [
+  ".git",
+  ".venv",
+  "3rdparty",
+  "build",
+  "dist",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
