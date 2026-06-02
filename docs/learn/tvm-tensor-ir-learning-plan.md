@@ -6,7 +6,7 @@
 
 当前 `3rdparty/tvm` 不是上游 TVM 的原始目录布局。学习时要先接受这个仓库的实际分层：
 
-- `tvm.tirx`：核心 TIR/TIRX IR 节点、buffer、expr、stmt、PrimFunc、build 入口、通用 lowering pass、codegen 前的 host/device 拆分。
+- `tvm.tirx`：核心 TIR/TIRX IR 节点、buffer、expr、stmt、PrimFunc、build 入口、通用 lowering pass、codegen 前的 host/device 标注、kernel 函数生成和 module 拆分 helper。
 - `tvm.s_tir`：更接近传统 TIR schedule/block 体系的层，包括 schedule primitive、SBlock 分析、meta-schedule、GPU lowering pass。
 - `tvm.script`：TVMScript 通用 parser、IR builder、printer 机制，`tirx` dialect 挂在这里。
 - `src/target` 与 `src/runtime`：target codegen、runtime module、device API、CUDA/OpenCL/LLVM/C host 等最终执行接口。
@@ -21,7 +21,7 @@
 2. `@T.prim_func` 为什么不是普通 Python 函数执行，而是通过 TVMScript parser 和 IR builder 构造 IR。
 3. `tirx.PrimFunc`、`Buffer`、`Var`、`BufferLoad`、`BufferStore`、`For`、`SBlock`、`ExecScopeStmt` 等节点的 C++/Python 定义在哪里。
 4. S-TIR 的 block/schedule 抽象如何表达计算块、迭代域、读写 region、调度 trace。
-5. 一个 kernel 经过 `tvm.tirx.build` 时，target binding、pipeline pass、host/device split、packed API、device launch lowering 如何发生。
+5. 一个 kernel 经过 `tvm.tirx.build` 时，target binding、pipeline pass、`SplitHostDevice`、`split_host_device_mods`、packed API、device launch lowering 如何发生。
 6. 最终 codegen 如何调用 `target.build.cuda`、`target.build.llvm`、`target.build.c` 等注册函数，并产出 `tvm.runtime.Module`。
 7. 如何用测试、`mod.script()`、单 pass 调试、`PassContext` 配置去定位 IR lowering 问题。
 
@@ -66,8 +66,8 @@ pytest tests/python/s_tir/schedule/test_tir_schedule_split_fuse.py -q
 读源码时优先使用这些命令：
 
 ```bash
-rg "class PrimFunc|register_object|GlobalDef|target.build|LowerTIRx|MakePackedAPI" 3rdparty/tvm
-rg "prim_func\\(|s_tir=True|tirx.build" 3rdparty/tvm/tests/python
+rg "class PrimFunc|register_object|GlobalDef|target.build|LowerTIRx|MakePackedAPI" .
+rg "prim_func\\(|s_tir=True|tirx.build" tests/python
 ```
 
 阶段验收：
@@ -91,14 +91,14 @@ rg "prim_func\\(|s_tir=True|tirx.build" 3rdparty/tvm/tests/python
 
 - TVM 的 `ObjectRef` / `Object` / `Node` / FFI 注册模型是什么。
 - `IRModule` 如何保存 `GlobalVar -> BaseFunc`。
-- `Target` 如何表示 `cuda -host=llvm` 这类组合 target。
+- `Target` 如何用嵌套 `host` 字段表示 `cuda -host=llvm` 这类组合 target，而不是依赖旧式 CLI target string。
 - `Pass`、`Sequential`、`PassContext` 的调用模型是什么。
 
 建议实验：
 
 1. 写一个最小 `IRModule`，打印 `mod.script()`。
 2. 查一个 pass 的 Python wrapper 和 C++ 注册函数如何对应。
-3. 在 Python 中构造 `tvm.target.Target("cuda")`，观察 `kind`、`keys`、`host`。
+3. 在 Python 中构造 `tvm.target.Target("cuda", host="llvm")`，观察 `kind`、`keys`、`host` 和 `export()`。
 
 阶段产出：
 
@@ -187,6 +187,8 @@ print(mod.script())
 阅读入口：
 
 - `3rdparty/tvm/include/tvm/s_tir/stmt.h`
+- `3rdparty/tvm/include/tvm/tirx/stmt.h`
+- `3rdparty/tvm/include/tvm/s_tir/sblock_scope.h`
 - `3rdparty/tvm/include/tvm/s_tir/schedule/*.h`
 - `3rdparty/tvm/src/s_tir/schedule/*`
 - `3rdparty/tvm/python/tvm/s_tir/schedule/*`
@@ -195,7 +197,8 @@ print(mod.script())
 
 重点问题：
 
-- `SBlock` / `SBlockRealize` 如何表达计算块、读写 region、迭代变量绑定。
+- `SBlock` / `SBlockRealize` 的节点定义为什么在 `tirx::Stmt` 体系里，而 S-TIR 在其上维护 schedule 状态。
+- `StmtSRef`、`SBlockScope`、`ScheduleState` 如何维护 sref tree、依赖信息和 AST 替换。
 - `Schedule`、`LoopRV`、`SBlockRV`、`Trace` 是什么。
 - `split`、`fuse`、`reorder`、`bind`、`cache_read/write`、`compute_at`、`tensorize` 如何修改 IR。
 - schedule primitive 的合法性检查在哪里做。
@@ -263,23 +266,26 @@ print(mod2.script())
 
 重点问题：
 
-- `tvm.tirx.build(mod, target, pipeline)` 的 7 个阶段是什么。
-- `pipeline="s_tir"` 和 `pipeline="tirx"` 的差异是什么。
-- `BindTarget` 在 pipeline 前绑定哪些 attr。
-- `AnnotateEntryFunc`、`AnnotateDeviceRegions`、`SplitHostDevice` 如何把一个 module 拆成 host/device。
+- `tvm.tirx.build(mod, target, pipeline)` 的控制流是什么：确定默认 target、确定 pipeline target、确定 host target、`BindTarget`、执行 pipeline、`split_host_device_mods`、finalize host/device passes、`tir_to_runtime`。
+- `pipeline="default"` 当前映射到 `s_tir`；`pipeline=None` 才走 `get_default_tir_pipeline(target)` 的 target-dependent 选择。理解这两种入口的区别。
+- `pipeline="s_tir"` 和 `pipeline="tirx"` 的输入假设和 pass 序列差异是什么：`s_tir` pipeline 面向 SBlock/schedule 风格 IR；`tirx` pipeline 先做 `LowerTIRx` / `LowerTIRxOpaque`，整体链更短。
+- `BindTarget` 在 pipeline 前如何给函数绑定 `target` attr，并如何按 host/device 调用关系选择 full target、host target 或 without-host device target。
+- `AnnotateEntryFunc`、`AnnotateDeviceRegions`、`SplitHostDevice` 如何标注入口、标出 device region，并在同一个 `IRModule` 中生成 device kernel 函数。
+- `split_host_device_mods` 如何在 pipeline 之后真正拆成 `host_mod` 和按 `Target` 分组的 `device_mod_dict`。
 - `MakePackedAPI` 如何把用户函数改写成 TVM packed function ABI。
 - `LowerDeviceKernelLaunch` 如何在 host 侧生成设备 kernel launch 调用。
 
 建议实验：
 
-1. 用同一个 vector add 分别走 `pipeline="s_tir"` 和 `pipeline="tirx"`，逐个 pass 打印 IR。
-2. 在 `PassContext` 中开关 `tirx.disable_vectorize`、`tirx.disable_cse_tir`，观察 pipeline 行为。
-3. 对 `SplitHostDevice` 前后的 module 做函数列表对比。
+1. 用 `@T.prim_func(s_tir=True)` 的 vector add 走 `pipeline="s_tir"`，逐个 pass 打印 IR。
+2. 另选一个 TIRX exec-scope 或 tile-primitive 风格的最小 case 走 `pipeline="tirx"`；不要把同一个 SBlock 程序当作两条 pipeline 的公平对照。
+3. 在 `PassContext` 中开关对应配置，观察 pipeline 行为：`s_tir` pipeline 使用 `tirx.disable_vectorize` / `tirx.disable_cse_tir`；`tirx` pipeline 使用 `tir.disable_vectorize` / `tir.disable_cse_tir`。
+4. 对 `SplitHostDevice` 前后的同一个 module 做函数列表和 attrs 对比，再对 `split_host_device_mods` 的 `host_mod` / `device_mod_dict` 做对比。
 
 阶段产出：
 
 - 一张完整 lowering pipeline 时序图。
-- 一份 “每个关键 pass 前后 IR 形态” 的对照表。
+- 一份 “每个关键 pass 前后 IR 形态” 的对照表，并明确哪些 pass 只是改写同一个 `IRModule`，哪些 Python helper 真正拆分 host/device modules。
 
 ## 10. 第 7 周：codegen 与 runtime
 
@@ -328,11 +334,12 @@ print(mod2.script())
 2. parser/builder 后的初始 `IRModule`。
 3. schedule 或 TIRX 扩展后的 IR。
 4. 每个关键 lowering pass 后的 IR。
-5. host/device split 后的函数列表和 attrs。
-6. packed API 后的 host 函数签名。
-7. target codegen 入口。
-8. runtime module 结构。
-9. 实际运行结果或无法运行时的原因。
+5. `SplitHostDevice` 后同一个 `IRModule` 里的函数列表和 attrs。
+6. `split_host_device_mods` 后的 `host_mod` 与 `device_mod_dict`。
+7. packed API 后的 host 函数签名。
+8. target codegen 入口。
+9. runtime module 结构。
+10. 实际运行结果或无法运行时的原因。
 
 建议最终产出：
 
@@ -348,10 +355,13 @@ print(mod2.script())
 - `3rdparty/tvm/src/tirx/ir/*`
 - `3rdparty/tvm/python/tvm/tirx/*.py`
 
-S-TIR schedule 与 block：
+S-TIR schedule 与 SBlock 相关状态：
 
+- `3rdparty/tvm/include/tvm/tirx/stmt.h`
 - `3rdparty/tvm/include/tvm/s_tir/*.h`
+- `3rdparty/tvm/include/tvm/s_tir/sblock_scope.h`
 - `3rdparty/tvm/include/tvm/s_tir/schedule/*.h`
+- `3rdparty/tvm/include/tvm/s_tir/schedule/state.h`
 - `3rdparty/tvm/src/s_tir/schedule/*`
 - `3rdparty/tvm/python/tvm/s_tir/schedule/*`
 
@@ -364,14 +374,15 @@ TVMScript：
 
 Pass 与 pipeline：
 
+- `3rdparty/tvm/python/tvm/tirx/build.py`
 - `3rdparty/tvm/python/tvm/tirx/compilation_pipeline.py`
 - `3rdparty/tvm/python/tvm/s_tir/pipeline.py`
+- `3rdparty/tvm/python/tvm/s_tir/backend/adreno/pipeline.py`
 - `3rdparty/tvm/src/tirx/transform/*`
 - `3rdparty/tvm/src/s_tir/transform/*`
 
 Build/codegen/runtime：
 
-- `3rdparty/tvm/python/tvm/tirx/build.py`
 - `3rdparty/tvm/src/target/codegen.cc`
 - `3rdparty/tvm/src/target/cuda/codegen_cuda.cc`
 - `3rdparty/tvm/src/target/llvm/llvm_module.cc`
@@ -395,16 +406,20 @@ Build/codegen/runtime：
 3. `include/tvm/tirx/function.h`
 4. `include/tvm/tirx/expr.h`
 5. `include/tvm/tirx/stmt.h`
-6. `include/tvm/tirx/buffer.h`
-7. `python/tvm/s_tir/schedule/schedule.py`
-8. `python/tvm/s_tir/pipeline.py`
-9. `python/tvm/tirx/compilation_pipeline.py`
-10. `python/tvm/tirx/build.py`
-11. `src/tirx/transform/split_host_device.cc`
-12. `src/tirx/transform/make_packed_api.cc`
-13. `src/tirx/transform/lower_device_kernel_launch.cc`
-14. `src/target/cuda/codegen_cuda.cc` 或 `src/target/source/codegen_c_host.cc`
-15. `src/runtime/module.cc`
+6. `include/tvm/s_tir/stmt.h`
+7. `include/tvm/s_tir/sblock_scope.h`
+8. `include/tvm/s_tir/schedule/state.h`
+9. `include/tvm/tirx/buffer.h`
+10. `python/tvm/s_tir/schedule/schedule.py`
+11. `python/tvm/tirx/build.py`
+12. `python/tvm/s_tir/pipeline.py`
+13. `python/tvm/tirx/compilation_pipeline.py`
+14. `python/tvm/s_tir/backend/adreno/pipeline.py`
+15. `src/tirx/transform/split_host_device.cc`
+16. `src/tirx/transform/make_packed_api.cc`
+17. `src/tirx/transform/lower_device_kernel_launch.cc`
+18. `src/target/cuda/codegen_cuda.cc` 或 `src/target/source/codegen_c_host.cc`
+19. `src/runtime/module.cc`
 
 ## 14. 学习时的固定问题模板
 
