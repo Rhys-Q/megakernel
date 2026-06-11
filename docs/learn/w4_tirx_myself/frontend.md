@@ -1,16 +1,18 @@
-# TIRX 前端入门：从 `@T.prim_func` 到 `TilePrimitiveCall`
+# TIRX 前端入门：从 TVMScript dialect 到 TIRX IR
 
-这篇文档只讲 TIRX 的“前端”部分：用户写的 Python 风格
-TVMScript DSL，如何被解析成 `tirx.PrimFunc`、`tirx.For`、
+这篇文档重新梳理 TIRX 的“前端”部分：用户写的 Python 风格
+TVMScript DSL，如何通过 TVMScript dialect 机制进入 TIRX 自己的
+parser / builder，最后被构造成 `tirx.PrimFunc`、`tirx.For`、
 `tirx.BufferStore`、`tirx.ExecScopeStmt`、`tirx.TilePrimitiveCall`
 这些 IR 节点。
 
-本文先不展开调度实现、lowering、CUDA/PTX codegen。你可以先把边界记成：
+本文只讨论前端边界：
 
 ```text
 TIRX 前端
-  用户 Python 源码
-    -> TVMScript parser
+  Python 源码
+    -> tvm.script dialect 解析
+    -> TIRX parser dispatch
     -> IRBuilder frame
     -> tirx.PrimFunc / Stmt / Expr / TilePrimitiveCall
 
@@ -21,7 +23,9 @@ TIRX 后续阶段
     -> target intrinsic / codegen
 ```
 
-## 1. 先看一个最小例子
+所以这篇不会展开调度、完整 lowering pipeline、CUDA/PTX codegen 和 runtime。
+
+## 1. 先看全链路
 
 用户一般这样写 TIRX/TensorIR 风格的函数：
 
@@ -35,11 +39,28 @@ def add_one(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")) -> Non
         B[i] = A[i] + T.float32(1.0)
 ```
 
-新手最容易误解的一点是：这个 Python 函数体不是普通 Python 函数那样执行。
-`@T.prim_func` 装饰器会拿到函数源码，把源码转成 Python AST，然后由
-TVMScript parser 访问 AST，把每一类语法翻译成 TIRX IR。
+这个 Python 函数体不是按普通 Python 函数执行。`@T.prim_func` 会触发
+TVMScript parser：parser 拿到函数源码，转成 Python AST，再按 `tirx`
+dialect 的规则把 AST 翻译成 TIRX IR。
 
-上面的代码大致会生成这样的 IR 结构：
+整体链路可以先记成：
+
+```mermaid
+flowchart TD
+    A["TVM bootstrap"] --> B["tvm.script 可注册 dialect"]
+    B --> C["tvm.tirx 注册 tirx -> tvm.tirx.script"]
+    D["from tvm.script import tirx as T"] --> E["tvm.script.__getattr__('tirx')"]
+    E --> F["import tvm.tirx.script"]
+    F --> G["T 暴露 prim_func / Buffer / kernel / copy 等 API"]
+    G --> H["@T.prim_func"]
+    H --> I["TVMScript core parse"]
+    I --> J["decorator dispatch_token = tirx"]
+    J --> K["tirx parser visitor"]
+    K --> L["tirx builder frame"]
+    L --> M["tirx.PrimFunc / Stmt / Expr"]
+```
+
+上面例子大致生成的 IR 结构是：
 
 ```text
 tirx.PrimFunc
@@ -56,72 +77,214 @@ tirx.PrimFunc
       )
 ```
 
-所以，TIRX 前端做的事情可以理解为：
+关键点是：
 
 ```text
-Python 语法长得像程序
-但 parser 把它解释成 IR 节点树
+Python 语法只是前端表达形式
+TVMScript parser 会把它解释成结构化 IR 节点树
 ```
 
-## 2. 入口：`from tvm.script import tirx as T`
+## 2. TVMScript dialect 设计
 
-TIRX 前端入口不是一个单独命令，而是 TVMScript dialect 机制。
+TIRX 前端不是硬编码在 `tvm.script` 里的一个静态属性，而是通过
+TVMScript dialect 机制接入。这个机制解决的问题是：
 
-关键源码：
+```text
+同一个 tvm.script 命名空间
+  可以挂多个 IR 方言
+  每个方言拥有自己的 parser / builder / printer
+  中央 tvm.script 不需要 eager import 所有方言实现
+```
 
+TIRX 就是其中一个 dialect。
+
+### 2.1 注册表：`_DIALECT_REGISTRY`
+
+核心源码：
+
+- `3rdparty/tvm/python/tvm/script/__init__.py`
 - `3rdparty/tvm/python/tvm/tirx/__init__.py`
 - `3rdparty/tvm/python/tvm/tirx/script/__init__.py`
-- `3rdparty/tvm/python/tvm/tirx/script/parser/entry.py`
-- `3rdparty/tvm/python/tvm/tirx/script/parser/parser.py`
-- `3rdparty/tvm/python/tvm/tirx/script/builder/ir.py`
-- `3rdparty/tvm/python/tvm/tirx/script/builder/tirx.py`
 
-`tvm.tirx.__init__` 里注册了 dialect：
+`tvm.script` 里维护一个 registry：
 
 ```python
+_DIALECT_REGISTRY: dict[str, str] = {}
+
+
+def register_dialect(name: str, module_path: str) -> None:
+    _DIALECT_REGISTRY[name] = module_path
+```
+
+TIRX 在自己的包初始化时注册：
+
+```python
+import tvm.script
+
 tvm.script.register_dialect("tirx", "tvm.tirx.script")
 ```
 
-因此用户写：
+含义是：
+
+```text
+短名 tirx
+  -> 对应的 TVMScript 包是 tvm.tirx.script
+```
+
+所以 `tirx` dialect 的 parser、builder、动态 tile primitive API，都由
+`tvm.tirx.script` 这一层负责提供。
+
+### 2.2 `from tvm.script import tirx as T` 如何工作
+
+用户写：
 
 ```python
 from tvm.script import tirx as T
 ```
 
-拿到的不是普通 Python 模块别名那么简单，而是 TVMScript 为 `tirx`
-dialect 准备好的一组 parser 和 builder API。`tvm.tirx.script.__init__`
-会把这些接口暴露出来：
+等价于向 `tvm.script` 模块取一个名为 `tirx` 的属性。`tvm.script` 本身没有
+静态定义 `tirx`，于是触发模块级 `__getattr__`：
+
+```python
+def __getattr__(name: str):
+    if name in _DIALECT_REGISTRY:
+        module = importlib.import_module(_DIALECT_REGISTRY[name])
+        globals()[name] = module
+        return module
+    ...
+```
+
+当 `name == "tirx"` 时：
+
+```text
+_DIALECT_REGISTRY["tirx"] == "tvm.tirx.script"
+```
+
+于是实际导入的是：
+
+```python
+import tvm.tirx.script
+T = tvm.tirx.script
+```
+
+这也是为什么 `T` 不是一个普通 Python 类型集合，而是一组 DSL API：
+
+```python
+T.prim_func
+T.Buffer
+T.Ptr
+T.serial
+T.grid
+T.kernel
+T.cta
+T.thread
+T.copy
+T.add
+```
+
+这些名字来自 `tvm.tirx.script` 对 parser 和 builder 的再导出。
+
+### 2.3 子包重定向：`tvm.script.parser.tirx`
+
+TVMScript 里还有一些历史或内部路径会写成：
+
+```python
+tvm.script.parser.tirx
+tvm.script.ir_builder.tirx
+from tvm.script.parser.tirx.entry import prim_func
+```
+
+但 TIRX 的真实实现路径已经在：
+
+```text
+tvm.tirx.script.parser
+tvm.tirx.script.builder
+```
+
+因此 `tvm.script` 还做了子包重定向：
+
+```python
+_REDIRECTED_SUBPACKAGES = {
+    "tvm.script.parser": "parser",
+    "tvm.script.ir_builder": "builder",
+}
+```
+
+解析规则可以理解成：
+
+```text
+tvm.script.parser.tirx
+  -> _DIALECT_REGISTRY["tirx"] + ".parser"
+  -> tvm.tirx.script.parser
+
+tvm.script.ir_builder.tirx
+  -> _DIALECT_REGISTRY["tirx"] + ".builder"
+  -> tvm.tirx.script.builder
+```
+
+对于更深的 import，例如：
+
+```python
+from tvm.script.parser.tirx.entry import prim_func
+```
+
+单靠模块 `__getattr__` 不够，因为 Python import machinery 不会逐层触发普通
+属性访问。源码里用 `_DialectRedirectFinder` 挂到 `sys.meta_path`，把这类深层
+路径别名到真实模块：
+
+```text
+tvm.script.parser.tirx.entry
+  -> tvm.tirx.script.parser.entry
+```
+
+这层设计让旧路径和新路径都能工作，也让新增 dialect 不需要改 `tvm.script`
+的静态 import 列表。
+
+### 2.4 dialect 包需要暴露什么
+
+`tvm.tirx.script.__init__` 是 TIRX dialect 的 public script 入口。它大致做三件事：
 
 ```python
 from .parser import *
 from .parser import Buffer, Ptr, prim_func
+from .builder.ir import TensorMap, meta_class
 from .builder.tirx import *
 ```
 
-也就是说，`T.prim_func`、`T.Buffer`、`T.serial`、`T.kernel`、
-`T.copy` 这些名字都来自 TIRX script 层。
+可以按职责拆开看：
 
-整体入口关系如下：
+| 层 | 真实路径 | 作用 |
+| --- | --- | --- |
+| dialect 注册 | `tvm/tirx/__init__.py` | 注册 `"tirx" -> "tvm.tirx.script"`。 |
+| dialect public API | `tvm/tirx/script/__init__.py` | 暴露 `T.prim_func`、`T.Buffer`、`T.kernel`、`T.copy` 等用户 API。 |
+| parser entry | `tvm/tirx/script/parser/entry.py` | 实现 `@T.prim_func`、`T.inline`、`T.macro`、`Buffer`/`Ptr` proxy。 |
+| parser visitor | `tvm/tirx/script/parser/parser.py` | 注册 `token="tirx"` 的 AST visitor。 |
+| builder Python API | `tvm/tirx/script/builder/ir.py` | 提供 loop、buffer、exec scope、dtype、intrinsic 等 builder 名字。 |
+| tile primitive API | `tvm/tirx/script/builder/tirx.py` | 提供 `T.copy`、`T.add`、`T.gemm` 等 tile primitive 前端。 |
+| builder C++ 实现 | `src/tirx/script/builder/*.cc` | frame 出栈时真正组装 TIRX IR 节点。 |
 
-```mermaid
-flowchart TD
-    A["import tvm.tirx"] --> B["register_dialect('tirx', 'tvm.tirx.script')"]
-    C["from tvm.script import tirx as T"] --> D["加载 tvm.tirx.script"]
-    D --> E["parser API: prim_func / Buffer / Ptr / macro"]
-    D --> F["builder API: serial / alloc_buffer / kernel / cta / copy / add"]
-    E --> G["@T.prim_func 触发 TVMScript parser"]
-    F --> H["parser 访问 AST 时调用 builder 生成 IR 节点"]
+注意：dialect 解析和 parser dispatch 是两层不同的机制。
+
+```text
+dialect 解析
+  解决 T 这个模块从哪里来
+
+parser dispatch
+  解决同一个 Python AST 应该按哪套 IR 规则访问
 ```
 
-## 3. `@T.prim_func` 到底做了什么
+`from tvm.script import tirx as T` 只解决第一件事。真正让 AST 走 TIRX 规则的是
+`dispatch_token="tirx"`。
 
-`@T.prim_func` 的实现入口在：
+## 3. `@T.prim_func` 如何选择 TIRX parser
+
+`@T.prim_func` 的入口在：
 
 ```text
 3rdparty/tvm/python/tvm/tirx/script/parser/entry.py
 ```
 
-核心逻辑可以简化成：
+简化后是：
 
 ```python
 def prim_func(func=None, private=False, check_well_formed=True, s_tir=False, persistent=False):
@@ -130,49 +293,44 @@ def prim_func(func=None, private=False, check_well_formed=True, s_tir=False, per
         f = parse(func, extra_vars, check_well_formed=check_well_formed, s_tir=s_tir)
         return f
 
-    return decorator_wrapper(func) if func is not None else decorator_wrapper
+    if func is not None:
+        return decorator_wrapper(func)
+    else:
+        setattr(decorator_wrapper, "dispatch_token", "tirx")
+        return decorator_wrapper
+
+
+setattr(prim_func, "dispatch_token", "tirx")
 ```
 
-这里有几个关键点：
+这里容易误解的一点是：`parse(...)` 本身没有传一个显式
+`dispatch_token="tirx"` 参数。token 是挂在 decorator 对象上的。
 
-| 概念 | 作用 |
-| --- | --- |
-| `inspect_function_capture` | 找出 Python 函数闭包里引用的变量，供 parser 求值。 |
-| `parse(...)` | 进入 TVMScript parser，把 Python AST 翻译成 IR。 |
-| `dispatch_token="tirx"` | 告诉通用 parser：访问 AST 时使用 TIRX 这套规则。 |
-| `s_tir=True` | 给构造出的 `PrimFunc` 标记 S-TIR/TensorIR 风格，方便后续 schedule/lowering。 |
+TVMScript core parser 访问 `FunctionDef` 时会：
 
-调用时序可以这样看：
+1. 读取函数 AST 上最后一个 decorator。
+2. 对 decorator 表达式求值，例如 `T.prim_func(s_tir=True)`。
+3. 从求值结果上读取 `decorator.dispatch_token`。
+4. 用这个 token 查 dispatch table。
 
-```mermaid
-sequenceDiagram
-    participant User as 用户代码
-    participant Decorator as T.prim_func
-    participant Core as TVMScript parse
-    participant Parser as tirx parser
-    participant Builder as tirx builder
-    participant IR as tirx IR
-
-    User->>Decorator: 定义 Python 函数 add_one
-    Decorator->>Decorator: 捕获闭包变量和源码位置
-    Decorator->>Core: parse(func, dispatch_token="tirx")
-    Core->>Parser: 访问 FunctionDef / For / Assign / Expr AST
-    Parser->>Builder: 调用 T.prim_func / T.arg / T.serial / T.buffer_store
-    Builder->>IR: 构造 PrimFunc / For / BufferStore / BufferLoad
-    IR-->>User: 返回 tirx.PrimFunc 对象
-```
-
-## 4. AST 如何变成 IR
-
-TIRX parser 的主要规则在：
+核心代码关系：
 
 ```text
-3rdparty/tvm/python/tvm/tirx/script/parser/parser.py
+Parser.visit_FunctionDef
+  -> get_dispatch_token(node)
+       -> eval_expr(node.decorator_list[-1])
+       -> decorator.dispatch_token == "tirx"
+  -> dispatch.get(token="tirx", type_name="FunctionDef")
+  -> tirx parser 的 visit_function_def
 ```
 
-它通过类似下面的注册方式，把不同 AST 节点交给不同处理函数：
+所以 TIRX parser 的接入方式是：
 
 ```python
+@dispatch.register(token="tirx", type_name="FunctionDef")
+def visit_function_def(self, node):
+    ...
+
 @dispatch.register(token="tirx", type_name="For")
 def visit_for(self, node):
     ...
@@ -180,15 +338,56 @@ def visit_for(self, node):
 @dispatch.register(token="tirx", type_name="Assign")
 def visit_assign(self, node):
     ...
+```
 
-@dispatch.register(token="tirx", type_name="FunctionDef")
-def visit_function_def(self, node):
-    ...
+同一棵 AST，如果 dispatch token 变成 Relax 或别的 dialect，就会走另一套 visitor。
+
+调用时序可以这样看：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户代码
+    participant T as tvm.tirx.script
+    participant Decorator as T.prim_func
+    participant Core as TVMScript core parser
+    participant Dispatch as dispatch table
+    participant Parser as tirx parser
+    participant Builder as tirx builder
+    participant IR as tirx IR
+
+    User->>T: from tvm.script import tirx as T
+    User->>Decorator: @T.prim_func(s_tir=True)
+    Decorator->>Core: parse(func, extra_vars, s_tir=True)
+    Core->>Core: eval decorator, read dispatch_token="tirx"
+    Core->>Dispatch: lookup ("tirx", AST node type)
+    Dispatch->>Parser: visit_FunctionDef / visit_For / visit_Assign
+    Parser->>Builder: enter frames and emit statements
+    Builder->>IR: construct PrimFunc / For / BufferStore
+    IR-->>User: return tirx.PrimFunc
+```
+
+## 4. AST 如何变成 TIRX IR
+
+TIRX parser 的主要规则在：
+
+```text
+3rdparty/tvm/python/tvm/tirx/script/parser/parser.py
+```
+
+核心模式是：
+
+```text
+Python AST node
+  -> dispatch(token="tirx", type_name=node_type)
+  -> TIRX visitor
+  -> builder API
+  -> IRBuilder frame
+  -> TIRX IR node
 ```
 
 ### 4.1 `FunctionDef` -> `tirx.PrimFunc`
 
-再看这个函数头：
+对于：
 
 ```python
 @T.prim_func(s_tir=True)
@@ -196,17 +395,18 @@ def add_one(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")) -> Non
     ...
 ```
 
-parser 访问 `FunctionDef` 时会做几件事：
+`visit_function_def` 会做几件事：
 
-1. 读取装饰器参数，比如 `private`、`s_tir`、`persistent`。
+1. 从 decorator 里读取 `private`、`s_tir`、`persistent`。
 2. 创建 `T.prim_func(...)` builder frame。
-3. 设置函数名。
-4. 解析参数注解 `T.Buffer((16,), "float32")`。
-5. 用 `T.arg(arg_name, annotation)` 创建参数。
-6. 访问函数体，生成 body。
-7. frame 退出时组装出 `tirx.PrimFunc`。
+3. 用 `T.func_name(node.name)` 设置函数名。
+4. 解析返回类型。
+5. 解析参数注解。
+6. 用 `T.arg(arg_name, annotation)` 创建参数。
+7. 访问函数体。
+8. frame 退出时组装 `tirx.PrimFunc`。
 
-可以把它想成：
+可以理解为：
 
 ```text
 def add_one(A: T.Buffer(...), B: T.Buffer(...)):
@@ -216,35 +416,32 @@ def add_one(A: T.Buffer(...), B: T.Buffer(...)):
 
 PrimFunc(
   params=[A_handle, B_handle],
-  buffer_map={A_handle: A_buffer, B_handle: B_buffer},
+  buffer_map={
+    A_handle: A_buffer,
+    B_handle: B_buffer,
+  },
   body=<由函数体生成的 Stmt 树>,
-  attrs={... s_tir ...}
+  attrs={..., "s_tir": True}
 )
 ```
 
 ### 4.2 参数注解 -> `Buffer` 和 `buffer_map`
 
-参数里的 `T.Buffer((16,), "float32")` 不是 Python 类型检查用的普通注解。
-parser 会对这个注解求值，得到 TIRX 的 `Buffer` 对象。
+参数里的：
 
 ```python
 A: T.Buffer((16,), "float32")
 ```
 
-含义是：
+不是 Python 类型检查用的普通注解。parser 会对这个注解求值，得到一个 TIRX
+`Buffer` 描述。函数参数底层仍然是 handle/ptr 形式，`buffer_map` 把 handle
+和结构化 buffer 信息连起来。
 
-```text
-A 是函数参数
-A 对应一个 shape=(16,), dtype=float32 的 Buffer
-函数真实形参底层仍然是 handle/ptr 形式
-buffer_map 记录 handle -> Buffer 的结构化信息
-```
-
-新手可以记住：
+新手可以这样记：
 
 ```text
 函数参数名 A
-  在用户代码里像 Buffer 一样使用
+  在用户 DSL 里像 Buffer 一样使用
   在 IR 里由参数 Var + buffer_map 共同表达
 ```
 
@@ -257,18 +454,16 @@ for i in range(16):
     B[i] = A[i] + T.float32(1.0)
 ```
 
-TIRX parser 对 `range(...)` 做了特殊处理。它不是创建 Python 迭代器，而是转换成
-`T.serial(...)` builder frame，最后生成 `tirx.For`。
-
-简化后的规则：
+TIRX parser 会在 AST 层特殊处理 `range(...)`。它不是创建 Python 迭代器，
+而是转换成 `T.serial(...)` builder frame：
 
 ```text
-range(16)      -> T.serial(0, 16)
-range(4, 16)   -> T.serial(4, 16)
-range(0, 16, 2)-> T.serial(0, 16, step=2)
+range(16)       -> T.serial(0, 16)
+range(4, 16)    -> T.serial(4, 16)
+range(0, 16, 2) -> T.serial(0, 16, step=2)
 ```
 
-生成的 IR 形态：
+frame 退出后生成：
 
 ```text
 For(
@@ -280,14 +475,14 @@ For(
 )
 ```
 
-如果用户写的是：
+如果用户写：
 
 ```python
 for i, j in T.grid(16, 16):
     C[i, j] = A[i, j] + B[i, j]
 ```
 
-parser 会把 `T.grid(16, 16)` 求值成多层 loop frame，最后得到嵌套 `For`：
+`T.grid(16, 16)` 会求值成多层 loop frame，最后得到嵌套 `For`：
 
 ```text
 For(i, 0, 16)
@@ -303,13 +498,13 @@ For(i, 0, 16)
 A[i]
 ```
 
-在 IR 里是一个表达式节点：
+在 IR 里是表达式节点：
 
 ```text
 BufferLoad(buffer=A, indices=[i])
 ```
 
-为什么 `BufferLoad` 是表达式？因为它产生一个值，可以参与加减乘除：
+`BufferLoad` 是表达式，因为它产生一个值，可以继续参与计算：
 
 ```python
 A[i] + T.float32(1.0)
@@ -332,7 +527,7 @@ Add(
 B[i] = A[i] + T.float32(1.0)
 ```
 
-parser 会识别左边是 `Subscript`，于是调用：
+parser 识别左边是 `Subscript`，于是调用：
 
 ```text
 T.buffer_store(buffer=B, value=<rhs>, indices=[i])
@@ -348,16 +543,16 @@ BufferStore(
 )
 ```
 
-这里也有一个重要区分：
+这里的区分很重要：
 
-| 语法 | IR 节点 | 为什么 |
+| 语法 | IR 节点 | 原因 |
 | --- | --- | --- |
 | `A[i]` | `BufferLoad` | 读 buffer，产生值，所以是 `PrimExpr`。 |
 | `B[i] = v` | `BufferStore` | 写 buffer，有副作用，所以是 `Stmt`。 |
 
 ### 4.6 `if` / `while` / `return`
 
-TIRX parser 还处理常见控制流：
+TIRX parser 也处理常见控制流：
 
 ```python
 if i < 8:
@@ -376,20 +571,23 @@ IfThenElse(
 )
 ```
 
-`while` 会生成 `tirx.While`，`return expr` 会被转成一个带返回语义的
-`Evaluate(tirx.ret(expr))`。
+`while` 会生成 `tirx.While`，`return expr` 会被转成带返回语义的：
+
+```text
+Evaluate(tirx.ret(expr))
+```
 
 ## 5. IRBuilder frame：为什么 `with` 能生成嵌套 IR
 
-TIRX 前端不是每解析一句就直接返回一个完整 IR，而是靠 IRBuilder 的 frame 栈累积语句。
+TIRX 前端不是每解析一句就直接返回完整 IR，而是靠 IRBuilder 的 frame 栈累积语句。
 
-你可以把 frame 理解成“正在构造的作用域”：
+frame 可以理解成“正在构造的作用域”：
 
 ```text
-进入一个 frame:
-  后续语句先放到这个 frame 里
+进入一个 frame
+  后续语句先加入这个 frame
 
-退出这个 frame:
+退出这个 frame
   frame 把收集到的语句包成一个 IR 节点
   再把这个节点加入父 frame
 ```
@@ -411,11 +609,11 @@ flowchart TD
     B --> C["进入 ExecScopeFrame: cta"]
     C --> D["进入 ExecScopeFrame: thread"]
     D --> E["生成 BufferStore"]
-    E --> F["退出 thread frame -> ExecScopeStmt(thread, body)"]
+    E --> F["退出 thread -> ExecScopeStmt(thread, body)"]
     F --> G["加入 cta frame"]
-    G --> H["退出 cta frame -> ExecScopeStmt(cta, body)"]
+    G --> H["退出 cta -> ExecScopeStmt(cta, body)"]
     H --> I["加入 kernel frame"]
-    I --> J["退出 kernel frame -> ExecScopeStmt(kernel, body)"]
+    I --> J["退出 kernel -> ExecScopeStmt(kernel, body)"]
     J --> K["加入 PrimFunc body"]
 ```
 
@@ -429,13 +627,16 @@ PrimFunc
         BufferStore(B, BufferLoad(A, [0]), [0])
 ```
 
-相关 C++ builder 入口在：
+相关入口：
 
 ```text
+3rdparty/tvm/python/tvm/tirx/script/builder/frame.py
+3rdparty/tvm/python/tvm/tirx/script/builder/ir.py
 3rdparty/tvm/src/tirx/script/builder/ir.cc
+3rdparty/tvm/src/tirx/script/builder/frame.cc
 ```
 
-里面可以看到：
+C++ builder 里能看到类似：
 
 ```cpp
 ExecScopeFrame Kernel(...) { return ExecScopeBlock("kernel", guards); }
@@ -443,20 +644,26 @@ ExecScopeFrame CTA(...)    { return ExecScopeBlock("cta", guards); }
 ExecScopeFrame Thread(...) { return ExecScopeBlock("thread", guards); }
 ```
 
-以及 frame 退出时会把 body 包成：
+frame 出栈时会把 body 包成：
 
 ```cpp
 tvm::tirx::ExecScopeStmt(exec_scope, body)
 ```
 
-这就是 `with T.kernel()`、`with T.cta()` 这种写法的本质。
+这就是 `with T.kernel()`、`with T.cta()`、`with T.thread()` 这种写法的本质：
+
+```text
+Python with 语法
+  -> builder frame 作用域
+  -> ExecScopeStmt 嵌套 IR
+```
 
 ## 6. Tile Primitive 前端：`T.copy` 只生成调用节点
 
 TIRX 除了普通 loop/load/store，还提供 tile primitive API。它们是更高层的
 kernel building block，例如 copy、add、gemm、reduction。
 
-先看一个简化例子：
+例子：
 
 ```python
 from tvm.script import tirx as T
@@ -468,8 +675,8 @@ def copy_tile(A: T.Buffer((128,), "float32"), B: T.Buffer((128,), "float32")):
         T.copy(B[0:128], A[0:128])
 ```
 
-这里的 `T.copy(...)` 在前端阶段不会立刻展开成 CUDA load/store。
-它只生成一个 `tirx.TilePrimitiveCall`：
+这里的 `T.copy(...)` 在前端阶段不会立刻展开成 CUDA load/store。它只生成一个
+`tirx.TilePrimitiveCall`：
 
 ```text
 TilePrimitiveCall(
@@ -507,7 +714,7 @@ def copy(dst, src, workspace=None, dispatch=None, **kwargs):
 3rdparty/tvm/python/tvm/tirx/operator/tile_primitive/ops.py
 ```
 
-它是 `TilePrimitiveCall` 的一个 typed wrapper：
+它是 `TilePrimitiveCall` 的 typed wrapper：
 
 ```python
 class Copy(TilePrimitiveCall):
@@ -516,7 +723,7 @@ class Copy(TilePrimitiveCall):
     src = ArgProperty(1)
 ```
 
-所以完整链路是：
+完整链路是：
 
 ```mermaid
 flowchart LR
@@ -551,7 +758,7 @@ TilePrimitiveCall(
 ```
 
 真正选择“用 scalar copy、vectorized copy、collective copy、TMA、tcgen05
-还是别的实现”，是在后续 operator dispatch/lowering 阶段完成的。
+还是别的实现”，是在后续 operator dispatch / lowering 阶段完成的。
 
 ## 7. 动态 tile primitive：为什么有些 `T.xxx` 源码里找不到
 
@@ -559,32 +766,38 @@ TilePrimitiveCall(
 
 ```python
 def __getattr__(name: str):
-    ...
     op_name = "tirx." + name
     ...
     return _fn
 ```
 
-它的作用是：如果用户写了一个没有显式定义的 `T.some_op(...)`，
-前端可以懒注册一个 `tirx.some_op`，并生成通用的 `TilePrimitiveCall`。
+它的作用是：如果用户写了一个没有显式定义的 `T.some_op(...)`，前端可以懒注册
+一个 `tirx.some_op`，并生成通用的 `TilePrimitiveCall`。
 
-这让 TIRX 的 tile primitive 前端更开放：
+例如：
 
 ```python
 T.my_custom_op(dst, src, config={"x": 1})
 ```
 
-也可以变成：
+可以变成：
 
 ```text
 TilePrimitiveCall(op=tirx.my_custom_op, args=[...], config={"x": 1})
 ```
 
-但这只解决“前端能表达”。后续如果没有 dispatch 实现，lowering 阶段仍然会失败。
+这只解决“前端能表达”。后续如果没有对应 dispatch 实现，lowering 阶段仍然会失败。
+
+这里有两层 `__getattr__`，不要混在一起：
+
+| 位置 | 作用 |
+| --- | --- |
+| `tvm.script.__getattr__` | 把 `tvm.script.tirx` 解析成 `tvm.tirx.script`。 |
+| `tvm.tirx.script.__getattr__` | 把未知 `T.xxx` 解析成动态 tile primitive 调用。 |
 
 ## 8. 前端产物和后续阶段的边界
 
-到这里，TIRX 前端已经完成了自己的核心任务：
+到这里，TIRX 前端已经完成核心任务：
 
 ```text
 用户 DSL
@@ -592,25 +805,35 @@ TilePrimitiveCall(op=tirx.my_custom_op, args=[...], config={"x": 1})
        body 中包含 For / BufferStore / ExecScopeStmt / TilePrimitiveCall
 ```
 
-后面才进入 TIRX lowering：
+前端会做：
 
-```text
-TilePrimitiveCall
-  -> TilePrimitiveDispatch
-  -> Python operator implementation
-  -> 返回更低层 PrimFunc
-  -> LowerTIRx cleanup
-  -> target codegen
-```
+| 输入语法 | 前端产物 |
+| --- | --- |
+| `@T.prim_func` | `tirx.PrimFunc` |
+| `A: T.Buffer(...)` | 参数 `Var` + `buffer_map` |
+| `for i in range(n)` | `tirx.For` |
+| `A[i]` | `tirx.BufferLoad` |
+| `B[i] = v` | `tirx.BufferStore` |
+| `with T.kernel()` | `tirx.ExecScopeStmt(kind=kernel)` |
+| `T.copy(...)` / `T.gemm(...)` | `tirx.TilePrimitiveCall` |
 
-相关入口包括：
+前端不会做：
+
+| 不在前端做的事 | 后续阶段 |
+| --- | --- |
+| 选择 tile primitive 的具体实现 | `TilePrimitiveDispatch` / operator dispatcher |
+| 展开 TIRX exec scope | `LowerTIRx` |
+| 做 target-specific intrinsic lowering | target lowering / codegen |
+| 生成 CUDA/PTX 或 host packed API | build pipeline / codegen / runtime |
+
+相关后续入口包括：
 
 - `3rdparty/tvm/python/tvm/tirx/transform/transform.py`
 - `3rdparty/tvm/src/tirx/transform/lower_tirx.cc`
 - `3rdparty/tvm/src/tirx/transform/tile_primitive_dispatch.cc`
 - `3rdparty/tvm/python/tvm/tirx/operator/tile_primitive/dispatcher.py`
 
-但这些已经超出本文的“前端”边界。本文只需要你记住：
+本文只需要记住：
 
 ```text
 T.copy / T.add / T.gemm 在前端阶段不是具体实现
@@ -618,73 +841,91 @@ T.copy / T.add / T.gemm 在前端阶段不是具体实现
 后续 pass 再把 TilePrimitiveCall 展开成目标相关实现
 ```
 
-## 9. 一张总图
+## 9. 一张更完整的总图
 
 ```mermaid
 flowchart TD
-    A["Python source: @T.prim_func"] --> B["entry.py::prim_func"]
-    B --> C["TVMScript parse"]
-    C --> D["parser.py dispatch token = tirx"]
+    A["import tvm / tvm.tirx"] --> B["register_dialect('tirx', 'tvm.tirx.script')"]
+    C["from tvm.script import tirx as T"] --> D["tvm.script.__getattr__('tirx')"]
+    D --> E["import tvm.tirx.script"]
+    E --> F["parser API: prim_func / Buffer / Ptr"]
+    E --> G["builder API: serial / kernel / copy / add"]
 
-    D --> E["FunctionDef visitor"]
-    E --> F["PrimFuncFrame"]
-    F --> G["T.arg / Buffer annotation"]
+    F --> H["@T.prim_func"]
+    H --> I["tvm.script.parser.core.entry.parse"]
+    I --> J["Source -> doc AST"]
+    J --> K["Parser.visit_FunctionDef"]
+    K --> L["eval decorator, dispatch_token='tirx'"]
+    L --> M["dispatch.get('tirx', node_type)"]
 
-    D --> H["For visitor"]
-    H --> I["ForFrame -> tirx.For"]
+    M --> N["FunctionDef visitor"]
+    N --> O["PrimFuncFrame / T.arg / Buffer annotation"]
 
-    D --> J["Assign visitor"]
-    J --> K["BufferLoad / BufferStore"]
+    M --> P["For visitor"]
+    P --> Q["ForFrame -> tirx.For"]
 
-    D --> L["With visitor"]
-    L --> M["ExecScopeFrame -> ExecScopeStmt"]
+    M --> R["Assign visitor"]
+    R --> S["BufferLoad / BufferStore"]
 
-    D --> N["Expr visitor"]
-    N --> O["T.copy / T.add / T.gemm"]
-    O --> P["TilePrimitiveCall"]
+    M --> T1["With visitor"]
+    T1 --> U["ExecScopeFrame -> ExecScopeStmt"]
 
-    G --> Q["tirx.PrimFunc"]
-    I --> Q
-    K --> Q
-    M --> Q
-    P --> Q
+    M --> V["Expr visitor"]
+    V --> W["T.copy / T.add / T.gemm"]
+    W --> X["TilePrimitiveCall"]
+
+    O --> Y["tirx.PrimFunc"]
+    Q --> Y
+    S --> Y
+    U --> Y
+    X --> Y
 ```
 
 ## 10. 推荐阅读顺序
 
-如果你想按源码继续读，建议按这个顺序：
+如果按源码继续读，建议按这个顺序：
 
-1. `3rdparty/tvm/python/tvm/tirx/__init__.py`
-   看 dialect 注册和 `tvm.tirx` 对外导出的 IR/API。
+1. `3rdparty/tvm/python/tvm/script/__init__.py`
+   看 `_DIALECT_REGISTRY`、`register_dialect`、`__getattr__`、
+   `_DialectRedirectFinder`。
 
-2. `3rdparty/tvm/python/tvm/tirx/script/__init__.py`
-   看 `tvm.script.tirx` 暴露了哪些 parser/builder API，以及动态
+2. `3rdparty/tvm/python/tvm/script/parser/core/parser.py`
+   看 `get_dispatch_token`、`with_dispatch_token`、`visit_FunctionDef`、
+   `visit` 如何按 token + AST type 分发。
+
+3. `3rdparty/tvm/python/tvm/tirx/__init__.py`
+   看 TIRX dialect 注册和 `tvm.tirx` 对外导出的 IR/API。
+
+4. `3rdparty/tvm/python/tvm/tirx/script/__init__.py`
+   看 `tvm.script.tirx` 暴露了哪些 parser / builder API，以及动态
    `TilePrimitiveCall` 的 `__getattr__`。
 
-3. `3rdparty/tvm/python/tvm/tirx/script/parser/entry.py`
-   看 `@T.prim_func` 如何捕获函数、闭包变量，并调用 `parse(...)`。
+5. `3rdparty/tvm/python/tvm/tirx/script/parser/entry.py`
+   看 `@T.prim_func` 如何捕获函数、闭包变量，并调用 TVMScript core
+   `parse(...)`。
 
-4. `3rdparty/tvm/python/tvm/tirx/script/parser/parser.py`
+6. `3rdparty/tvm/python/tvm/tirx/script/parser/parser.py`
    看 `FunctionDef`、`For`、`Assign`、`With`、`Expr` 等 AST 节点如何变成 IR。
 
-5. `3rdparty/tvm/python/tvm/tirx/script/builder/ir.py`
+7. `3rdparty/tvm/python/tvm/tirx/script/builder/ir.py`
    看 Python 侧 builder API 名字。很多具体构造会通过 FFI 进入 C++ builder。
 
-6. `3rdparty/tvm/src/tirx/script/builder/ir.cc`
+8. `3rdparty/tvm/src/tirx/script/builder/ir.cc`
    看 C++ IRBuilder frame 如何在退出 scope 时组装 `For`、`ExecScopeStmt`、
    `BufferStore` 等节点。
 
-7. `3rdparty/tvm/python/tvm/tirx/script/builder/tirx.py`
+9. `3rdparty/tvm/python/tvm/tirx/script/builder/tirx.py`
    看 `T.copy`、`T.add`、`T.gemm` 这类 tile primitive API 如何插入
    `TilePrimitiveCall`。
 
-8. `3rdparty/tvm/python/tvm/tirx/operator/tile_primitive/ops.py`
-   看 `Copy`、`Add`、`Gemm` 等 typed wrapper 如何定义 op 和参数访问器。
+10. `3rdparty/tvm/python/tvm/tirx/operator/tile_primitive/ops.py`
+    看 `Copy`、`Add`、`Gemm` 等 typed wrapper 如何定义 op 和参数访问器。
 
-读完这些，你应该能回答三个前端核心问题：
+读完这些，你应该能回答四个前端核心问题：
 
 ```text
-1. @T.prim_func 为什么返回的是 tirx.PrimFunc，而不是 Python 函数？
-2. for / if / buffer 读写为什么会变成 IR 节点？
-3. T.copy / T.gemm 为什么只是 TilePrimitiveCall，而不是马上生成 CUDA 代码？
+1. from tvm.script import tirx as T 为什么能定位到 tvm.tirx.script？
+2. @T.prim_func 为什么返回的是 tirx.PrimFunc，而不是 Python 函数？
+3. for / if / buffer 读写为什么会变成 IR 节点？
+4. T.copy / T.gemm 为什么只是 TilePrimitiveCall，而不是马上生成 CUDA 代码？
 ```
