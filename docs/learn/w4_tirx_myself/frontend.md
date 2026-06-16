@@ -84,6 +84,145 @@ Python 语法只是前端表达形式
 TVMScript parser 会把它解释成结构化 IR 节点树
 ```
 
+### 1.1 `add_one` 的解析时序
+
+以上面的 `add_one` 为例，前端解析的时序是：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户代码
+    participant Script as tvm.script [共享]
+    participant CoreParse as TVMScript parse [共享]
+    participant Parser as Core Parser [共享]
+    participant Dispatch as dispatch table [共享]
+    participant TIRXScript as tvm.tirx.script [TIRX]
+    participant Decorator as T.prim_func [TIRX]
+    participant TIRXParser as TIRX parser [TIRX]
+    participant Builder as TIRX builder/IRBuilder [TIRX]
+    participant IR as TIRX IR [TIRX]
+
+    User->>Script: [共享] from tvm.script import tirx as T
+    Script->>Script: [共享] 查 _DIALECT_REGISTRY["tirx"]
+    Script->>TIRXScript: [共享->TIRX] import tvm.tirx.script
+    TIRXScript-->>User: [返回/TIRX] T = tvm.tirx.script
+
+    User->>Decorator: [TIRX] 执行 @T.prim_func(s_tir=True)
+    Decorator-->>User: [返回/TIRX] 返回 decorator_wrapper
+
+    User->>Decorator: [TIRX] Python 自动调用 decorator_wrapper(add_one)
+    Decorator->>CoreParse: [共享入口] parse(add_one, extra_vars, s_tir=True)
+
+    CoreParse->>Parser: [共享] 创建 Source / Parser / IRBuilder
+    Parser->>Parser: [共享] source.as_ast()
+    Parser->>Parser: [共享] visit(FunctionDef add_one)
+
+    Parser->>Parser: [共享] eval decorator T.prim_func(s_tir=True)
+    Parser->>Parser: [共享] 读取 dispatch_token = "tirx"
+    Parser->>Dispatch: [共享] lookup("tirx", "FunctionDef")
+    Dispatch-->>Parser: [返回/TIRX] TIRX visit_function_def
+
+    Parser->>TIRXParser: [TIRX] visit_function_def(add_one)
+    TIRXParser->>Builder: [TIRX] T.prim_func(is_private=False, s_tir=True)
+    Builder-->>TIRXParser: [返回/TIRX] PrimFuncFrame
+    TIRXParser->>Builder: [TIRX] T.func_name("add_one")
+
+    TIRXParser->>TIRXParser: [TIRX] eval A: T.Buffer((16,), "float32")
+    TIRXParser->>Builder: [TIRX] T.arg("A", A_buffer)
+    Builder->>Builder: [TIRX] params += A_handle
+    Builder->>Builder: [TIRX] buffer_map[A_handle] = A_buffer
+
+    TIRXParser->>TIRXParser: [TIRX] eval B: T.Buffer((16,), "float32")
+    TIRXParser->>Builder: [TIRX] T.arg("B", B_buffer)
+    Builder->>Builder: [TIRX] params += B_handle
+    Builder->>Builder: [TIRX] buffer_map[B_handle] = B_buffer
+
+    TIRXParser->>Parser: [共享] visit body
+
+    Parser->>Parser: [共享] visit(For i in range(16))
+    Parser->>Dispatch: [共享] lookup("tirx", "For")
+    Dispatch-->>Parser: [返回/TIRX] TIRX visit_for
+    Parser->>TIRXParser: [TIRX] visit_for
+    TIRXParser->>Builder: [TIRX] T.serial(0, 16)
+    Builder-->>TIRXParser: [返回/TIRX] ForFrame
+    TIRXParser->>Builder: [TIRX] enter ForFrame, bind i
+
+    TIRXParser->>Parser: [共享] visit loop body
+
+    Parser->>Parser: [共享] visit(Assign B[i] = ...)
+    Parser->>Dispatch: [共享] lookup("tirx", "Assign")
+    Dispatch-->>Parser: [返回/TIRX] TIRX visit_assign
+    Parser->>TIRXParser: [TIRX] visit_assign
+
+    TIRXParser->>TIRXParser: [TIRX] eval RHS: A[i] + T.float32(1.0)
+    TIRXParser->>IR: [TIRX] A[i] -> BufferLoad(A, [i])
+    TIRXParser->>IR: [TIRX] T.float32(1.0) -> FloatImm(1.0)
+    TIRXParser->>IR: [TIRX] + -> Add(BufferLoad, FloatImm)
+
+    TIRXParser->>TIRXParser: [TIRX] eval LHS index: B[i]
+    TIRXParser->>Builder: [TIRX] T.buffer_store(B, Add(...), [i])
+    Builder->>IR: [TIRX] BufferStore(B, Add(...), [i])
+    Builder->>Builder: [TIRX] add BufferStore to ForFrame body
+
+    TIRXParser->>Builder: [TIRX] exit ForFrame
+    Builder->>IR: [TIRX] For(i, 0, 16, body=BufferStore)
+    Builder->>Builder: [TIRX] add For to PrimFuncFrame body
+
+    TIRXParser->>Builder: [TIRX] exit PrimFuncFrame
+    Builder->>IR: [TIRX] PrimFunc(params, buffer_map, body=For)
+    Builder-->>CoreParse: [返回/TIRX] builder.get() returns tirx.PrimFunc
+
+    CoreParse-->>Decorator: [返回] tirx.PrimFunc
+    Decorator-->>User: [返回] add_one = tirx.PrimFunc
+```
+
+### 1.2 TVMScript parse 架构图
+
+`parse()` 的设计可以看成“共享 parser 框架 + dialect 插件规则”的组合。共享层
+负责拿源码、建 AST、维护变量表、管理 IRBuilder 和做 dispatch；每个 dialect
+只需要注册自己的 decorator、AST visitor 和 builder frame。
+
+```mermaid
+flowchart TD
+    A["输入 program [共享]\nPython function / class / str / doc.AST"] --> B["Source(program) [共享]\n获取源码、文件名、起始行列"]
+    B --> C["source.as_ast() [共享]\ndoc.parse(source) -> doc.AST"]
+
+    A --> D["收集 annotations [共享]\ninspect.isfunction / inspect.isclass"]
+    A --> E["extra_vars [共享]\n闭包变量、默认 T/R/I/tvm 名字"]
+
+    C --> F["Parser(source, annotations) [共享]"]
+    D --> F
+    E --> G["VarTable frame [共享]\n表达式求值环境"]
+    F --> G
+
+    F --> H["IRBuilder() [共享]\n当前线程 builder、frame 栈、最终 result"]
+    G --> I["Parser.visit(AST) [共享]\n按 doc AST 遍历"]
+
+    I --> J["遇到 FunctionDef [共享]\neval decorator"]
+    J --> K["读取 dispatch_token [共享]\n例如 tirx / relax / ir"]
+    K --> L["dispatch.get(token, node_type) [共享]\n查 ParseVTable"]
+
+    L --> M["dialect visitor [dialect]\nvisit_function_def / visit_for / visit_assign"]
+    M --> N["dialect builder API [dialect]\nT.prim_func / T.serial / T.buffer_store"]
+    N --> O["dialect frame exit [dialect]\nPrimFuncFrame / ForFrame 组装 IR"]
+    O --> H
+
+    H --> P["builder.get() [共享]\n返回构造出的 IR"]
+    P --> Q["well-formed check [共享入口]\n按 s_tir / tirx / relax 检查"]
+    Q --> R["parse 返回 [共享]\n例如 tvm.tirx.function.PrimFunc"]
+```
+
+以 `add_one` 为例，这张图里对应关系是：
+
+| 架构节点 | `add_one` 中的具体表现 |
+| --- | --- |
+| `program` | `@T.prim_func` 传进来的 Python function object。 |
+| `Source(program)` | 从 `add_one` 函数对象找到源码文本。 |
+| `extra_vars` | 包含用户代码里的 `T`，也就是 `tvm.tirx.script`。 |
+| `dispatch_token` | `T.prim_func(s_tir=True)` 上的 token 是 `"tirx"`。 |
+| `dialect visitor` | TIRX 的 `visit_function_def`、`visit_for`、`visit_assign`。 |
+| `dialect builder` | `T.prim_func`、`T.arg`、`T.serial`、`T.buffer_store`。 |
+| `builder.get()` | 返回 `tvm.tirx.function.PrimFunc`。 |
+
 ## 2. TVMScript dialect 设计
 
 TIRX 前端不是硬编码在 `tvm.script` 里的一个静态属性，而是通过
