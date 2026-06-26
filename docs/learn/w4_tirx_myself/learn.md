@@ -1,5 +1,12 @@
 目录在3rdparty/tvm/python/tvm/tirx
 
+本目录学习文档
+
+- frontend.md: TIRX TVMScript 前端与 parser/builder 学习笔记。
+- ir.md: TIRX IR 对象模型学习笔记。
+- tirx_passes.md: TIRX pass 和 build pipeline 学习笔记。
+- codegen.md: TIRX codegen 原理与实现学习笔记。
+
 核心顶层文件
 
 - 3rdparty/tvm/python/tvm/tirx/__init__.py: tvm.tirx 入口，注册 tirx TVMScript dialect，导出 Expr/Stmt/Buffer/Layout/Transform/Analysis/Build 等公共 API。
